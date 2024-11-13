@@ -2,11 +2,16 @@
 //!
 //! Provides an async `run` function that listens for inbound connections,
 //! spawning a task per connection.
-use mini_redis::{DbDropGuard, Db, Connection, Shutdown};
-use mini_redis;
-use tokio::net::TcpListener;
+use mini_redis::{Connection};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Semaphore};
 use std::sync::Arc;
+use futures::Future;
+use tracing::info;
+use tokio::time::{self, Duration};
+
+use crate::{Db, DbDropGuard};
+use crate::{Shutdown};
 
 
 /// Server listener state. Created in the `run` call. It includes a `run` method
@@ -75,11 +80,11 @@ const MAX_CONNECTIONS:usize = 200;
 pub async fn run(listener: TcpListener, shutdown: impl Future) {
 
     // shutdown using broadcast
-    let (notify_shutdown, _) = boradcast::channel(1);
+    let (notify_shutdown, _) = broadcast::channel(1);
     let (shutdown_complete_tx, mut shutdown_rx) = mpsc::channel(1);
     
 
-    let server = Listener {
+    let mut server = Listener {
         listener,
         db_holder: DbDropGuard::new(),
         limit_connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
@@ -115,6 +120,77 @@ impl Listener {
     /// The process is not able to detect when a transient error resolves
     /// itself. One strategy for handling this is to implement a back off
     /// strategy, which is what we do here.
-    async fn run() -> Result {}
+    async fn run(&mut self) -> crate::Result<()> {
+        info!("accepting inbound connections");
+
+        loop {
+            // Wait for a permit to become available
+            //
+            // `acquire_owned` returns a permit that is bound to the semaphore.
+            // When the permit value is dropped, it is automatically returned
+            // to the semaphore.
+            //
+            // `acquire_owned()` returns `Err` when the semaphore has been
+            // closed. We don't ever close the semaphore, so `unwrap()` is safe.
+            let permit = self
+                .limit_connections
+                .clone()
+                .acquire_owned()
+                .await
+                .unwrap();
+
+            // Accept a new socket. This will attempt to perform error handling.
+            // The `accept` method internally attempts to recover errors, so an
+            // error here is non-recoverable.
+            let socket = self.accept().await?;
+
+            // Create the necessary per-connection handler state.
+            let handler = Handler {
+                db: self.db_holder.db(),
+                connect: Connection::new(socket),
+                shutdown: Shutdown::new(self.notify_shutdown.subscribe()),
+                _shutdown_complete: self.shutdown_complete_tx.clone(),
+            };
+
+            // Spawn a new task to process the connections. Tokio tasks are like
+            // asynchronous green threads and are executed concurrently.
+            tokio::spawn(async move {
+                handler.run()
+            });
+        }
+
+        return Ok(())
+    }
+
+    /// Accept an inbound connection.
+    ///
+    /// Errors are handled by backing off and retrying. An exponential backoff
+    /// strategy is used. After the first failure, the task waits for 1 second.
+    /// After the second failure, the task waits for 2 seconds. Each subsequent
+    /// failure doubles the wait time. If accepting fails on the 6th try after
+    /// waiting for 64 seconds, then this function returns with an error.
+    async fn accept(&mut self) -> crate::Result<TcpStream> {
+        let mut backoff = 1;
+
+        loop {
+            match self.listener.accept().await {
+                Ok((socket, _)) => return Ok(socket),
+                Err(err) => {
+                    if backoff > 64 {
+                        return Err(err.into())
+                    }
+                }
+            }
+            time::sleep(Duration::from_secs(backoff)).await;
+            backoff = backoff << 1;
+
+        }
+    }
 }
 
+
+impl Handler {
+    async fn run(&mut self) -> crate::Result<()> {
+        
+    }
+}

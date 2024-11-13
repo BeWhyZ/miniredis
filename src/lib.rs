@@ -2,6 +2,11 @@
 pub mod server;
 
 mod db;
+use db::Db;
+use db::DbDropGuard;
+
+mod shutdown;
+use shutdown::Shutdown;
 
 /// Error returned by most functions.
 ///

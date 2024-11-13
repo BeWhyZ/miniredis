@@ -70,11 +70,6 @@ fn main() {
 
     mini_tokio.spawn(async move {
         let when = Instant::now() + Duration::from_secs(3);
-        let future = Delay {when};
-
-        let out = future.await;
-        assert_eq!(out, "done");
-
     });
 
     mini_tokio.run();
